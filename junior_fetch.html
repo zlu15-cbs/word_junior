@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Fetch Definitions (MW sd2 → sd3, robust vis)</title>
+  <style>
+    body { font: 16px/1.45 system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial; margin: 32px; color:#111; }
+    h1 { margin: 0 0 8px 0; font-size: 22px; }
+    textarea { width: 100%; min-height: 120px; padding: 10px; border:1px solid #ccd3db; border-radius:10px; background: #f4f6f8; }
+    button { margin-top:10px; padding: 10px 14px; font-weight:700; border-radius:10px; cursor:pointer; }
+    table { width:100%; border-collapse: collapse; margin-top:20px; }
+    th, td { border:1px solid #e2e8f0; padding:8px 10px; vertical-align:top; }
+    th { background:#f8fafc; }
+    a { color:#0b6bff; text-decoration:none; }
+    a:hover { text-decoration:underline; }
+    #status { margin-left:10px; font-size:13px; color:#555; }
+  </style>
+</head>
+<body>
+  <h1>Fetch Definitions (Merriam-Webster sd2 → sd3)</h1>
+  <p>Enter words (comma or newline separated). Click the button. The <b>Example</b> column pulls the first <code>vis → t</code> (verbal illustration) found anywhere in the entry (dt, et_snote, pt, snote, uns, utxt).</p>
+
+  <textarea id="words">apple
+peer
+pear</textarea><br>
+  <button id="fetchDefinitions">Fetch Definitions</button><span id="status"></span>
+
+  <div id="output"></div>
+
+<script>
+/* ---------------- config ---------------- */
+const MW_KEY_SD2 = "b6064719-257f-42a8-879d-d3094f6b8cfc";
+const MW_KEY_SD3 = "36f22e3b-2381-4187-b858-80f1828c52d1";
+
+/* ---------------- helpers ---------------- */
+function stripMWTags(text=""){
+  return text
+    .replace(/\{bc\}|\{bd\}/g, ": ")
+    .replace(/\{it\}|\{\/it\}|\{wi\}|\{\/wi\}|\{sc\}|\{\/sc\}/g, "")
+    .replace(/\{ldquo\}/g, '"').replace(/\{rdquo\}/g, '"')
+    .replace(/\{a_link\|([^}]+)\}/g, "$1")
+    .replace(/\{sx\|([^|}]+)[^}]*\}/g, "$1")
+    .replace(/\{.*?\}/g, "")     // drop remaining tags
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+// Build audio URL from MW "sound.audio"
+function mwAudioUrl(audioId){
+  if(!audioId) return "";
+  let sub="";
+  if (audioId.startsWith("bix")) sub="bix";
+  else if (audioId.startsWith("gg")) sub="gg";
+  else if (/^[0-9\W]/.test(audioId)) sub="number";
+  else sub = audioId[0];
+  return `https://media.merriam-webster.com/audio/prons/en/us/mp3/${sub}/${audioId}.mp3`;
+}
+
+/* --------- Robust VIS extractor (dt, et_snote, pt, snote, uns, utxt) --------- */
+// Walk any structure; collect texts from ["vis", [ { t: "...", aq?: ... }, ... ]]
+function collectVisTextsDeep(node, out){
+  if (!node) return;
+  if (Array.isArray(node)){
+    // If this array itself looks like a VIS node
+    if (node.length >= 2 && node[0] === "vis" && Array.isArray(node[1])){
+      for (const v of node[1]){
+        if (v && typeof v.t === "string") out.push(stripMWTags(v.t));
+      }
+    }
+    // Recurse into children
+    for (const el of node) collectVisTextsDeep(el, out);
+  } else if (typeof node === "object"){
+    for (const k in node){
+      // Only traverse known example-bearing containers or any nested object/array
+      // (dt, et_snote, pt, snote, uns, utxt can appear at many levels)
+      collectVisTextsDeep(node[k], out);
+    }
+  }
+}
+
+function firstVisTextFromItems(items){
+  for (const it of items){
+    const out = [];
+    collectVisTextsDeep(it, out);
+    if (out.length) return out[0];
+  }
+  return "";
+}
+
+// Choose a concise definition/pos from first item that has shortdef
+function pickDefinitionAndPos(items){
+  for (const it of items){
+    const pos = it.fl || "";
+    const short = Array.isArray(it.shortdef) ? it.shortdef[0] : "";
+    if (short) return { definition: stripMWTags(short), pos };
+  }
+  return { definition: "", pos: "" };
+}
+
+// Choose a pronunciation from the first item that has one
+function pickPronunciation(items){
+  for (const it of items){
+    const prs0 = it?.hwi?.prs?.[0];
+    if (prs0){
+      const mw = prs0.mw || "";
+      const audioId = prs0.sound?.audio || "";
+      return { text: mw, audio: mwAudioUrl(audioId) };
+    }
+  }
+  return { text: "", audio: "" };
+}
+
+/* ---------------- fetchers ---------------- */
+async function fetchDict(word, dict, key){
+  const url = `https://dictionaryapi.com/api/v3/references/${dict}/json/${encodeURIComponent(word)}?key=${key}`;
+  const res = await fetch(url, { mode: "cors" });
+  const json = await res.json();
+  if (!Array.isArray(json) || (json[0] && typeof json[0] === "string")) return null; // suggestions or empty
+  return json;
+}
+
+async function fetchWord(word){
+  // Try sd2 first
+  const items2 = await fetchDict(word, "sd2", MW_KEY_SD2);
+  if (items2){
+    const { definition, pos } = pickDefinitionAndPos(items2);
+    const example2 = firstVisTextFromItems(items2);
+    const pron = pickPronunciation(items2);
+
+    if (definition){
+      if (example2) {
+        return { word, pos, definition, example: example2, pronunciationText: pron.text, pronunciationAudio: pron.audio };
+      }
+      // fallback to sd3 just to fill an example
+      const items3 = await fetchDict(word, "sd3", MW_KEY_SD3);
+      if (items3){
+        const ex3 = firstVisTextFromItems(items3);
+        const pron3 = (pron.text || pron.audio) ? pron : pickPronunciation(items3);
+        return { word, pos, definition, example: ex3 || "", pronunciationText: pron3.text, pronunciationAudio: pron3.audio };
+      }
+      return { word, pos, definition, example: "", pronunciationText: pron.text, pronunciationAudio: pron.audio };
+    }
+  }
+
+  // If sd2 failed entirely, try sd3 for everything
+  const items3 = await fetchDict(word, "sd3", MW_KEY_SD3);
+  if (items3){
+    const { definition, pos } = pickDefinitionAndPos(items3);
+    if (definition){
+      const example = firstVisTextFromItems(items3);
+      const pron = pickPronunciation(items3);
+      return { word, pos, definition, example, pronunciationText: pron.text, pronunciationAudio: pron.audio };
+    }
+  }
+
+  return null;
+}
+
+/* ---------------- UI ---------------- */
+const btn = document.getElementById("fetchDefinitions");
+const statusEl = document.getElementById("status");
+const output = document.getElementById("output");
+const wordsTA = document.getElementById("words");
+
+btn.addEventListener("click", async () => {
+  const raw = wordsTA.value.split(/[\n,]/).map(s => s.trim()).filter(Boolean);
+  // dedupe
+  const seen = new Set(), words = [];
+  for (const w of raw){ const k = w.toLowerCase(); if (!seen.has(k)) { seen.add(k); words.push(w); } }
+
+  if (!words.length){ statusEl.textContent = "Please enter at least one word."; return; }
+
+  statusEl.textContent = "Fetching..."; btn.disabled = true; output.innerHTML = "";
+
+  const rows = []; let done = 0;
+  for (const w of words){
+    try { const r = await fetchWord(w); if (r) rows.push(r); } catch {}
+    done++; statusEl.textContent = `Fetched ${done}/${words.length}`;
+  }
+
+  btn.disabled = false;
+
+  if (!rows.length){ statusEl.textContent = "No definitions found."; return; }
+
+  const table = document.createElement("table");
+  table.innerHTML = `
+    <thead>
+      <tr>
+        <th>word</th>
+        <th>pos</th>
+        <th>definition</th>
+        <th>example (vis.t)</th>
+        <th>pronunciation</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  `;
+  const tbody = table.querySelector("tbody");
+
+  rows.forEach(r => {
+    const tr = document.createElement("tr");
+    const audioCell = r.pronunciationAudio
+      ? `<a href="${r.pronunciationAudio}" target="_blank" rel="noopener">${r.pronunciationText || "Play audio"}</a>`
+      : (r.pronunciationText || "");
+    tr.innerHTML = `
+      <td>${r.word}</td>
+      <td>${r.pos || ""}</td>
+      <td>${r.definition || ""}</td>
+      <td>${r.example || ""}</td>
+      <td>${audioCell}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  output.appendChild(table);
+  statusEl.textContent = "Done.";
+});
+</script>
+</body>
+</html>
